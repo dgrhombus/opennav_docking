@@ -26,6 +26,7 @@
 #include "nav2_util/simple_action_server.hpp"
 #include "nav_2d_utils/odom_subscriber.hpp"
 #include "opennav_docking/controller.hpp"
+#include "opennav_docking/docking_align_law.hpp"
 #include "opennav_docking/utils.hpp"
 #include "opennav_docking/types.hpp"
 #include "opennav_docking/dock_database.hpp"
@@ -96,6 +97,22 @@ public:
    * @param dock_pose The target pose that will be used to rotate.
    */
   void rotateToDock(const geometry_msgs::msg::PoseStamped & dock_pose);
+
+  /**
+   * @brief Pre-alignment stage before the control-law approach (forward
+   * docking only, gated by pre_alignment.enabled). Stage 1 rotates in place
+   * until the bearing to the detected dock is inside
+   * rotation_angular_tolerance (reusing the rotate-to-heading command).
+   * Stage 2 strafes laterally (base-frame vy) onto the dock axis while
+   * holding the bearing, so holonomic platforms hand the approach law a
+   * near-straight problem. Runs on every approach attempt, retries included.
+   * @param dock Dock instance, gets queried for refined pose.
+   * @param dock_pose Dock pose, refined by perception while aligning.
+   * @returns True when aligned, False if cancelled/preempted. Throws
+   *          FailedToDetectDock on detection loss and FailedToControl on
+   *          pre_alignment.timeout, matching approachDock's semantics.
+   */
+  bool preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped & dock_pose);
 
   /**
    * @brief Wait for charging to begin.
@@ -256,6 +273,17 @@ protected:
   double dock_prestaging_tolerance_;
   // Angular tolerance to exit the rotation loop when rotate_to_dock is enabled
   double rotation_angular_tolerance_;
+  // Pre-alignment stage (forward docking): rotate to zero bearing, then
+  // strafe onto the dock axis, before handing off to the approach control law
+  bool pre_alignment_enabled_;
+  double pre_alignment_timeout_;
+  // Lateral offset from the dock axis at which pre-alignment is satisfied
+  double pre_align_lateral_tolerance_;
+  StrafeParams strafe_params_;
+  // When > 0, freeze the detected dock pose once the robot is within this
+  // distance of it and finish the approach against the frozen (fixed-frame)
+  // pose — close-range detection dropout can no longer fail the approach
+  double dock_pose_latch_distance_;
 
   // This is a class member so it can be accessed in publish feedback
   rclcpp::Time action_start_time_;

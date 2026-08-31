@@ -15,6 +15,7 @@
 #include <cmath>
 
 #include "nav2_util/node_utils.hpp"
+#include "opennav_docking/docking_align_law.hpp"
 #include "opennav_docking/simple_charging_dock.hpp"
 
 namespace opennav_docking
@@ -72,6 +73,14 @@ void SimpleChargingDock::configure(
   nav2_util::declare_parameter_if_not_declared(
     node_, name + ".docking_threshold", rclcpp::ParameterValue(0.05));
 
+  // Optional heading gate on the contact check: when > 0, isDocked() also
+  // requires the robot's yaw to be within this tolerance of the dock axis,
+  // so an off-angle arrival fails (and retries) instead of being declared
+  // docked. 0.0 preserves the historical XY-only behavior. Forward docking
+  // semantics (the robot's heading matches the dock yaw at contact).
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name + ".docking_yaw_tolerance", rclcpp::ParameterValue(0.0));
+
   // Staging pose configuration
   nav2_util::declare_parameter_if_not_declared(
     node_, name + ".staging_x_offset", rclcpp::ParameterValue(-0.7));
@@ -94,6 +103,7 @@ void SimpleChargingDock::configure(
   node_->get_parameter(name + ".stall_velocity_threshold", stall_velocity_threshold_);
   node_->get_parameter(name + ".stall_effort_threshold", stall_effort_threshold_);
   node_->get_parameter(name + ".docking_threshold", docking_threshold_);
+  node_->get_parameter(name + ".docking_yaw_tolerance", docking_yaw_tolerance_);
   node_->get_parameter(name + ".staging_x_offset", staging_x_offset_);
   node_->get_parameter(name + ".staging_yaw_offset", staging_yaw_offset_);
   node_->get_parameter("base_frame", base_frame_id_);  // Get server base frame ID
@@ -273,7 +283,9 @@ bool SimpleChargingDock::isDocked()
   double d = std::hypot(
     base_pose.pose.position.x - dock_pose_.pose.position.x,
     base_pose.pose.position.y - dock_pose_.pose.position.y);
-  return d < docking_threshold_;
+  const double yaw_err = tf2::getYaw(base_pose.pose.orientation) -
+    tf2::getYaw(dock_pose_.pose.orientation);
+  return isWithinContactTolerance(d, yaw_err, docking_threshold_, docking_yaw_tolerance_);
 }
 
 bool SimpleChargingDock::isCharging()

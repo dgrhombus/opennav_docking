@@ -142,6 +142,8 @@ protected:
   double charging_threshold_;
   // If not using an external pose reference, this is the distance threshold
   double docking_threshold_;
+  // Heading gate on the contact check; 0.0 = XY-only (historical behavior)
+  double docking_yaw_tolerance_;
   std::string base_frame_id_;
   // Offset for staging pose relative to dock pose
   double staging_x_offset_;

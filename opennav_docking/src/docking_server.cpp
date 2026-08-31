@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
+
 #include "angles/angles.h"
 #include "opennav_docking/docking_server.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -44,6 +46,19 @@ DockingServer::DockingServer(const rclcpp::NodeOptions & options)
   declare_parameter("odom_topic", "odom");
   declare_parameter("rotation_angular_tolerance", 0.05);
   declare_parameter("rotate_to_dock", false);
+  // Pre-alignment stage (forward docking). Rotation speed/accel reuse the
+  // controller.rotate_to_heading_* params; the bearing tolerance reuses
+  // rotation_angular_tolerance. v_lateral_max <= 0 disables the strafe stage
+  // (rotate-only pre-alignment).
+  declare_parameter("pre_alignment.enabled", false);
+  declare_parameter("pre_alignment.timeout", 15.0);
+  declare_parameter("pre_alignment.k_lateral", 1.5);
+  declare_parameter("pre_alignment.v_lateral_min", 0.0);
+  declare_parameter("pre_alignment.v_lateral_max", 0.0);
+  declare_parameter("pre_alignment.lateral_deadband", 0.02);
+  declare_parameter("pre_alignment.lateral_tolerance", 0.03);
+  // 0.0 disables the close-range dock-pose latch.
+  declare_parameter("dock_pose_latch_distance", 0.0);
 }
 
 nav2_util::CallbackReturn
@@ -65,6 +80,14 @@ DockingServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
   get_parameter("dock_backwards", dock_backwards_);
   get_parameter("dock_prestaging_tolerance", dock_prestaging_tolerance_);
   get_parameter("rotation_angular_tolerance", rotation_angular_tolerance_);
+  get_parameter("pre_alignment.enabled", pre_alignment_enabled_);
+  get_parameter("pre_alignment.timeout", pre_alignment_timeout_);
+  get_parameter("pre_alignment.k_lateral", strafe_params_.k_lateral);
+  get_parameter("pre_alignment.v_lateral_min", strafe_params_.v_lateral_min);
+  get_parameter("pre_alignment.v_lateral_max", strafe_params_.v_lateral_max);
+  get_parameter("pre_alignment.lateral_deadband", strafe_params_.lateral_deadband);
+  get_parameter("pre_alignment.lateral_tolerance", pre_align_lateral_tolerance_);
+  get_parameter("dock_pose_latch_distance", dock_pose_latch_distance_);
 
   RCLCPP_INFO(get_logger(), "Controller frequency set to %.4fHz", controller_frequency_);
 
@@ -80,6 +103,10 @@ DockingServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
   if (rotate_to_dock_ && !dock_backwards_) {
     throw std::runtime_error{"Parameter rotate_to_dock is enabled but dock_backwards is not set."
             "Please set dock_backwards to true."};
+  }
+  if (pre_alignment_enabled_ && dock_backwards_) {
+    throw std::runtime_error{"Parameter pre_alignment.enabled requires forward docking "
+            "(dock_backwards must be false)."};
   }
 
   double action_server_result_timeout;
@@ -445,11 +472,99 @@ void DockingServer::rotateToDock(const geometry_msgs::msg::PoseStamped & dock_po
   }
 }
 
+bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped & dock_pose)
+{
+  const double dt = 1.0 / controller_frequency_;
+  rclcpp::Rate loop_rate(controller_frequency_);
+  auto start = this->now();
+  auto timeout = rclcpp::Duration::from_seconds(pre_alignment_timeout_);
+  // Fix-yaw-first: rotate stage completes once, then the strafe stage holds
+  // the bearing while nulling the lateral offset. The latch avoids stage
+  // chatter when strafing perturbs the bearing near the tolerance boundary.
+  bool rotate_stage_done = false;
+
+  while (rclcpp::ok()) {
+    publishDockingFeedback(DockRobot::Feedback::CONTROLLING);
+
+    if (checkAndWarnIfCancelled(docking_action_server_, "dock_robot") ||
+      checkAndWarnIfPreempted(docking_action_server_, "dock_robot"))
+    {
+      return false;
+    }
+
+    // Same perception honesty as the approach loop: a stale detection here
+    // is a hard failure (the robot is still ~a meter out with the tag in
+    // view; there is no excuse for blindness at this range).
+    if (!dock->plugin->getRefinedPose(dock_pose)) {
+      throw opennav_docking_core::FailedToDetectDock(
+              "Failed dock detection during pre-alignment");
+    }
+
+    // Dock pose in the base frame drives both stages.
+    geometry_msgs::msg::PoseStamped target_pose = dock_pose;
+    target_pose.header.stamp = rclcpp::Time(0);
+    tf2_buffer_->transform(target_pose, target_pose, base_frame_);
+    const double x_d = target_pose.pose.position.x;
+    const double y_d = target_pose.pose.position.y;
+    const double yaw_d = tf2::getYaw(target_pose.pose.orientation);
+    const double bearing = std::atan2(y_d, x_d);
+    const double e_lat = lateralOffsetFromDockAxis(x_d, y_d, yaw_d);
+
+    const bool bearing_ok = std::fabs(bearing) < rotation_angular_tolerance_;
+    if (!rotate_stage_done && bearing_ok) {
+      rotate_stage_done = true;
+      RCLCPP_INFO(
+        get_logger(), "Pre-alignment rotation complete (lateral offset %.3fm)", e_lat);
+    }
+
+    geometry_msgs::msg::Twist command;
+    if (rotate_stage_done) {
+      command.linear.y = computeStrafeCommand(e_lat, strafe_params_);
+      const bool strafe_disabled = strafe_params_.v_lateral_max <= 0.0;
+      const bool lateral_ok = std::fabs(e_lat) < pre_align_lateral_tolerance_;
+      if (bearing_ok && (strafe_disabled || lateral_ok)) {
+        publishZeroVelocity();
+        RCLCPP_INFO(
+          get_logger(), "Pre-alignment complete (bearing %.3frad, lateral %.3fm)",
+          bearing, e_lat);
+        return true;
+      }
+    }
+
+    // Rotate toward zero bearing in both stages: the primary motion of stage
+    // one, and the bearing hold while strafing in stage two (the command
+    // self-limits near zero via its overshoot guard).
+    geometry_msgs::msg::Twist current_vel;
+    current_vel.angular.z = odom_sub_->getTwist().theta;
+    command.angular.z =
+      controller_->computeRotateToHeadingCommand(bearing, current_vel, dt).angular.z;
+    vel_publisher_->publish(command);
+
+    if (this->now() - start > timeout) {
+      publishZeroVelocity();
+      throw opennav_docking_core::FailedToControl("Timed out pre-aligning to dock");
+    }
+
+    loop_rate.sleep();
+  }
+  return false;
+}
+
 bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & dock_pose)
 {
+  // Align (rotate, then optionally strafe) before engaging the approach
+  // control law, so the law starts from a near-straight problem. Runs on
+  // every attempt so a post-retry approach re-aligns too.
+  if (pre_alignment_enabled_) {
+    if (!preAlignToDock(dock, dock_pose)) {
+      return false;
+    }
+  }
+
   rclcpp::Rate loop_rate(controller_frequency_);
   auto start = this->now();
   auto timeout = rclcpp::Duration::from_seconds(dock_approach_timeout_);
+  bool latched = false;
   while (rclcpp::ok()) {
     publishDockingFeedback(DockRobot::Feedback::CONTROLLING);
 
@@ -465,9 +580,28 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
       return false;
     }
 
-    // Update perception
-    if (!dock->plugin->getRefinedPose(dock_pose) && !rotate_to_dock_) {
-      throw opennav_docking_core::FailedToDetectDock("Failed dock detection");
+    // Update perception — unless the dock pose is latched. Once the robot is
+    // inside dock_pose_latch_distance the last refined pose (fixed frame,
+    // locally smooth odom) is frozen and the rest of the approach closes the
+    // loop on odom: close-range detection dropout can no longer stale-fail
+    // the approach or steer it on a decaying estimate. The plugin's internal
+    // pose freezes with it, so isDocked() measures against the same target.
+    if (!latched) {
+      if (!dock->plugin->getRefinedPose(dock_pose) && !rotate_to_dock_) {
+        throw opennav_docking_core::FailedToDetectDock("Failed dock detection");
+      }
+      if (dock_pose_latch_distance_ > 0.0) {
+        const auto robot_pose = getRobotPoseInFrame(dock_pose.header.frame_id);
+        const double dist_to_dock = std::hypot(
+          robot_pose.pose.position.x - dock_pose.pose.position.x,
+          robot_pose.pose.position.y - dock_pose.pose.position.y);
+        if (dist_to_dock < dock_pose_latch_distance_) {
+          latched = true;
+          RCLCPP_INFO(
+            get_logger(), "Dock pose latched at %.2fm; finishing approach on odom",
+            dist_to_dock);
+        }
+      }
     }
 
     // Transform target_pose into base_link frame
