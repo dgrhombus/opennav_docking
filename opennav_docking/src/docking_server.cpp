@@ -57,6 +57,9 @@ DockingServer::DockingServer(const rclcpp::NodeOptions & options)
   // exceed the floor on its own once the platform is standing still. 0.0
   // disables the floor (wheeled platforms).
   declare_parameter("pre_alignment.min_angular_vel", 0.0);
+  // Cap for the stage-2 bearing hold (bang-bang with hysteresis, see
+  // computeBearingHoldCommand); the floor above is its minimum.
+  declare_parameter("pre_alignment.hold_angular_vel_max", 0.5);
   declare_parameter("pre_alignment.k_lateral", 1.5);
   declare_parameter("pre_alignment.v_lateral_min", 0.0);
   declare_parameter("pre_alignment.v_lateral_max", 0.0);
@@ -88,6 +91,7 @@ DockingServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
   get_parameter("pre_alignment.enabled", pre_alignment_enabled_);
   get_parameter("pre_alignment.timeout", pre_alignment_timeout_);
   get_parameter("pre_alignment.min_angular_vel", pre_align_min_angular_vel_);
+  get_parameter("pre_alignment.hold_angular_vel_max", pre_align_hold_max_angular_vel_);
   get_parameter("pre_alignment.k_lateral", strafe_params_.k_lateral);
   get_parameter("pre_alignment.v_lateral_min", strafe_params_.v_lateral_min);
   get_parameter("pre_alignment.v_lateral_max", strafe_params_.v_lateral_max);
@@ -493,6 +497,12 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
   // the bearing while nulling the lateral offset. The latch avoids stage
   // chatter when strafing perturbs the bearing near the tolerance boundary.
   bool rotate_stage_done = false;
+  // Stage-2 bearing hold hysteresis state (computeBearingHoldCommand).
+  bool hold_active = false;
+  BearingHoldParams hold_params;
+  hold_params.tolerance = rotation_angular_tolerance_;
+  hold_params.min_angular_vel = pre_align_min_angular_vel_;
+  hold_params.max_angular_vel = pre_align_hold_max_angular_vel_;
   // Accel-ramp anchor for the rotate command. Anchoring to the MEASURED odom
   // yaw rate deadlocks on platforms with a yaw gait floor: the robot ignores
   // the small first-step command, odom stays zero, and the ramp re-issues
@@ -548,16 +558,21 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
       }
     }
 
-    // Rotate toward zero bearing in both stages: the primary motion of stage
-    // one, and the bearing hold while strafing in stage two (the command
-    // self-limits near zero via its overshoot guard). The gait floor applies
-    // only while the bearing is outside tolerance — the in-band hold must not
-    // force the platform to micro-twitch while strafing.
-    geometry_msgs::msg::Twist current_vel;
-    current_vel.angular.z = last_cmd_wz;
-    command.angular.z = applyRotationFloor(
-      controller_->computeRotateToHeadingCommand(bearing, current_vel, dt).angular.z,
-      bearing, rotation_angular_tolerance_, pre_align_min_angular_vel_);
+    if (!rotate_stage_done) {
+      // Stage one: ramped rotate-to-heading toward zero bearing, lifted to
+      // the gait floor while outside tolerance (and never floored against
+      // the bearing's sign — see applyRotationFloor).
+      geometry_msgs::msg::Twist current_vel;
+      current_vel.angular.z = last_cmd_wz;
+      command.angular.z = applyRotationFloor(
+        controller_->computeRotateToHeadingCommand(bearing, current_vel, dt).angular.z,
+        bearing, rotation_angular_tolerance_, pre_align_min_angular_vel_);
+    } else {
+      // Stage two: bang-bang hold with hysteresis while strafing. The full
+      // rotate controller here overshot a 4 deg error into 30 deg under
+      // sensing lag and started the wrong-way spin (Pozole 2026-09-01).
+      command.angular.z = computeBearingHoldCommand(bearing, hold_params, hold_active);
+    }
     last_cmd_wz = command.angular.z;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
@@ -717,19 +732,23 @@ bool DockingServer::resetApproach(const geometry_msgs::msg::PoseStamped & stagin
 
     // The retry only needs the robot back at the approach's own start state:
     // behind the staging plane (not still on the dock side, where the tag is
-    // at marginal detection range) and inside the prestaging ball — the same
-    // gate a fresh dock_robot starts from. Squaring to the staging heading is
-    // NOT required (see reset_angular_tolerance above).
+    // at marginal detection range). That IS the fresh dock_robot start state
+    // — the caller's approach pose sits well behind staging — so no distance
+    // ball is required: requiring dist < prestaging tolerance as well made a
+    // mid-approach failure that was already behind the plane drive toward a
+    // point in front of it. Squaring to the staging heading is NOT required
+    // (see reset_angular_tolerance above). NOTE: this only terminates when
+    // the staging pose lives in a fixed frame; a dock goal seeded in the
+    // robot base frame makes staging a moving target 0.3 m behind the robot
+    // and the reset backs up until dock_approach_timeout (Pozole 2026-09-01).
     const auto robot_pose = getRobotPoseInFrame(staging_pose.header.frame_id);
     const double dx = robot_pose.pose.position.x - staging_pose.pose.position.x;
     const double dy = robot_pose.pose.position.y - staging_pose.pose.position.y;
     const double dist_to_staging = std::hypot(dx, dy);
-    if (dist_to_staging < dock_prestaging_tolerance_ &&
-      isBehindStagingPlane(dx, dy, tf2::getYaw(staging_pose.pose.orientation)))
-    {
+    if (isBehindStagingPlane(dx, dy, tf2::getYaw(staging_pose.pose.orientation))) {
       RCLCPP_INFO(
-        get_logger(), "Reset complete: behind staging within pre-staging tolerance (%.2fm)",
-        dist_to_staging);
+        get_logger(), "Reset complete: behind staging plane (%.2fm from staging, frame %s)",
+        dist_to_staging, staging_pose.header.frame_id.c_str());
       publishZeroVelocity();
       return true;
     }

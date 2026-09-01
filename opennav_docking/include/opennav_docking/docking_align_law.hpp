@@ -77,17 +77,64 @@ inline double computeStrafeCommand(double e_lat, const StrafeParams & p)
 /// under the floor produces zero motion and the bearing never converges
 /// (Pozole 2026-09-01: 0.15 rad/s commanded for 15 s, dog never moved).
 /// The floor applies only while the bearing is still outside tolerance —
-/// once in-band (the stage-2 hold) the raw command passes through so the
-/// robot is not forced to micro-twitch while strafing. Sign is preserved;
-/// min_angular_vel <= 0 disables the floor.
+/// once in-band the raw command passes through so the robot is not forced to
+/// micro-twitch. Sign is preserved; min_angular_vel <= 0 disables the floor.
+///
+/// The floor is also skipped while the command's sign disagrees with the
+/// bearing's. That is the accel ramp decelerating through zero after the
+/// bearing changed side; flooring it re-asserts the OLD direction at full
+/// gait speed every tick, the ramp (anchored to the last command) can then
+/// never cross zero, and the robot spins the wrong way until the tag leaves
+/// the FOV (Pozole 2026-09-01 15:05:23: bearing +0.60 rad, wz -0.400 for 3 s).
+/// Passing the ramp through lets it cross within a few ticks, after which the
+/// floor engages in the right direction.
 inline double applyRotationFloor(
   double wz, double bearing, double bearing_tolerance, double min_angular_vel)
 {
   if (min_angular_vel <= 0.0 || wz == 0.0 || std::fabs(bearing) < bearing_tolerance) {
     return wz;
   }
+  if ((wz > 0.0) != (bearing > 0.0)) {
+    return wz;
+  }
   const double magnitude = std::max(std::fabs(wz), min_angular_vel);
   return wz > 0.0 ? magnitude : -magnitude;
+}
+
+struct BearingHoldParams
+{
+  double tolerance = 0.10;          // engage the hold at |bearing| >= tolerance
+  double k_bearing = 1.5;           // proportional gain once engaged
+  double min_angular_vel = 0.0;     // gait floor: minimum magnitude when engaged
+  double max_angular_vel = 0.5;     // cap on the hold command
+};
+
+/// Stage-2 bearing hold for the pre-alignment strafe: keep the dock centred
+/// while strafing without running the full rotate-to-heading controller.
+/// That controller drives at its cruise rate toward zero bearing and, with
+/// detection/filter lag, overshoots a 4 deg error into a 30 deg one (Pozole
+/// 2026-09-01 15:05:22: wz -0.41 for bearing -0.073, next sample +0.60).
+/// Bang-bang with hysteresis instead: engage at |bearing| >= tolerance,
+/// release below tolerance/2, output sign(bearing) * clamp(k*|bearing|,
+/// min, max) while engaged and 0 otherwise. hold_active carries the
+/// hysteresis state between ticks.
+inline double computeBearingHoldCommand(
+  double bearing, const BearingHoldParams & p, bool & hold_active)
+{
+  const double abs_bearing = std::fabs(bearing);
+  if (abs_bearing >= p.tolerance) {
+    hold_active = true;
+  } else if (abs_bearing < 0.5 * p.tolerance) {
+    hold_active = false;
+  }
+  if (!hold_active || bearing == 0.0) {
+    return 0.0;
+  }
+  double magnitude = std::min(p.k_bearing * abs_bearing, p.max_angular_vel);
+  if (p.min_angular_vel > 0.0) {
+    magnitude = std::max(magnitude, p.min_angular_vel);
+  }
+  return bearing > 0.0 ? magnitude : -magnitude;
 }
 
 /// True when the robot sits at or behind the staging plane — the plane

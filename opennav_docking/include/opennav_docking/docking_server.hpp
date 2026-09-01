@@ -278,6 +278,7 @@ protected:
   bool pre_alignment_enabled_;
   double pre_alignment_timeout_;
   double pre_align_min_angular_vel_;
+  double pre_align_hold_max_angular_vel_;
   // Lateral offset from the dock axis at which pre-alignment is satisfied
   double pre_align_lateral_tolerance_;
   StrafeParams strafe_params_;

@@ -54,6 +54,13 @@ void SimpleChargingDock::configure(
     node_, name + ".external_detection_rotation_roll", rclcpp::ParameterValue(-1.57));
   nav2_util::declare_parameter_if_not_declared(
     node_, name + ".filter_coef", rclcpp::ParameterValue(0.1));
+  // When false, the external detection supplies POSITION only and the dock
+  // heading is carried from the initial (fixed-frame) dock pose the goal was
+  // seeded with. Single small fiducials give an unreliable yaw at range
+  // (planar-pose ambiguity flips the tilt sign), and the pre-alignment
+  // lateral offset is a direct function of that yaw.
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name + ".use_external_detection_orientation", rclcpp::ParameterValue(true));
 
   // Charging threshold from BatteryState message
   nav2_util::declare_parameter_if_not_declared(
@@ -90,6 +97,8 @@ void SimpleChargingDock::configure(
   node_->get_parameter(name + ".use_battery_status", use_battery_status_);
   node_->get_parameter(name + ".use_external_detection_pose", use_external_detection_pose_);
   node_->get_parameter(name + ".external_detection_timeout", external_detection_timeout_);
+  node_->get_parameter(
+    name + ".use_external_detection_orientation", use_external_detection_orientation_);
   node_->get_parameter(
     name + ".external_detection_translation_x", external_detection_translation_x_);
   node_->get_parameter(
@@ -229,16 +238,25 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
   detected = filter_->update(detected);
   filtered_dock_pose_pub_->publish(detected);
 
-  // Rotate the just the orientation, then remove roll/pitch
-  geometry_msgs::msg::PoseStamped just_orientation;
-  just_orientation.pose.orientation = tf2::toMsg(external_detection_rotation_);
-  geometry_msgs::msg::TransformStamped transform;
-  transform.transform.rotation = detected.pose.orientation;
-  tf2::doTransform(just_orientation, just_orientation, transform);
+  if (use_external_detection_orientation_) {
+    // Rotate the just the orientation, then remove roll/pitch
+    geometry_msgs::msg::PoseStamped just_orientation;
+    just_orientation.pose.orientation = tf2::toMsg(external_detection_rotation_);
+    geometry_msgs::msg::TransformStamped transform;
+    transform.transform.rotation = detected.pose.orientation;
+    tf2::doTransform(just_orientation, just_orientation, transform);
 
-  tf2::Quaternion orientation;
-  orientation.setEuler(0.0, 0.0, tf2::getYaw(just_orientation.pose.orientation));
-  dock_pose_.pose.orientation = tf2::toMsg(orientation);
+    tf2::Quaternion orientation;
+    orientation.setEuler(0.0, 0.0, tf2::getYaw(just_orientation.pose.orientation));
+    dock_pose_.pose.orientation = tf2::toMsg(orientation);
+  } else {
+    // Heading from the seed: `pose` is the goal's dock pose (fixed frame) on
+    // the first call and our own previous output afterwards, so the yaw is
+    // carried unchanged tick to tick. Flatten defensively.
+    tf2::Quaternion orientation;
+    orientation.setEuler(0.0, 0.0, tf2::getYaw(pose.pose.orientation));
+    dock_pose_.pose.orientation = tf2::toMsg(orientation);
+  }
 
   // Construct dock_pose_ by applying translation/rotation
   dock_pose_.header = detected.header;

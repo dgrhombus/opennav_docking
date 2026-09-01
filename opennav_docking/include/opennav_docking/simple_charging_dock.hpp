@@ -130,6 +130,7 @@ protected:
 
   // An external reference (such as image_proc::TrackMarkerNode) can be used to detect dock
   bool use_external_detection_pose_;
+  bool use_external_detection_orientation_;
   double external_detection_timeout_;
   tf2::Quaternion external_detection_rotation_;
   double external_detection_translation_x_;
