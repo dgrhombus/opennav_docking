@@ -72,6 +72,34 @@ inline double computeStrafeCommand(double e_lat, const StrafeParams & p)
   return e_lat > 0.0 ? -magnitude : magnitude;
 }
 
+/// Platform gait floor for the pre-alignment rotate command. Quadrupeds
+/// (Go2) do not take a step below a minimum in-place yaw rate, so a command
+/// under the floor produces zero motion and the bearing never converges
+/// (Pozole 2026-09-01: 0.15 rad/s commanded for 15 s, dog never moved).
+/// The floor applies only while the bearing is still outside tolerance —
+/// once in-band (the stage-2 hold) the raw command passes through so the
+/// robot is not forced to micro-twitch while strafing. Sign is preserved;
+/// min_angular_vel <= 0 disables the floor.
+inline double applyRotationFloor(
+  double wz, double bearing, double bearing_tolerance, double min_angular_vel)
+{
+  if (min_angular_vel <= 0.0 || wz == 0.0 || std::fabs(bearing) < bearing_tolerance) {
+    return wz;
+  }
+  const double magnitude = std::max(std::fabs(wz), min_angular_vel);
+  return wz > 0.0 ? magnitude : -magnitude;
+}
+
+/// True when the robot sits at or behind the staging plane — the plane
+/// through the staging pose perpendicular to its heading (staging yaw points
+/// at the dock, so positive longitudinal displacement means the robot is on
+/// the dock side and still needs to back out). dx/dy are robot position
+/// minus staging position in the same fixed frame.
+inline bool isBehindStagingPlane(double dx, double dy, double staging_yaw)
+{
+  return dx * std::cos(staging_yaw) + dy * std::sin(staging_yaw) <= 0.0;
+}
+
 /// Contact criterion: XY distance within dist_thresh AND, when yaw_thresh > 0,
 /// heading error within yaw_thresh. yaw_thresh <= 0 preserves the historical
 /// XY-only behavior. yaw_err may be un-normalized; it is wrapped here.

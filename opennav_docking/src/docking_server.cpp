@@ -52,6 +52,11 @@ DockingServer::DockingServer(const rclcpp::NodeOptions & options)
   // (rotate-only pre-alignment).
   declare_parameter("pre_alignment.enabled", false);
   declare_parameter("pre_alignment.timeout", 15.0);
+  // Gait floor for the rotate stage: quadrupeds ignore in-place yaw commands
+  // below their step threshold, and the rotate command's accel ramp cannot
+  // exceed the floor on its own once the platform is standing still. 0.0
+  // disables the floor (wheeled platforms).
+  declare_parameter("pre_alignment.min_angular_vel", 0.0);
   declare_parameter("pre_alignment.k_lateral", 1.5);
   declare_parameter("pre_alignment.v_lateral_min", 0.0);
   declare_parameter("pre_alignment.v_lateral_max", 0.0);
@@ -82,6 +87,7 @@ DockingServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
   get_parameter("rotation_angular_tolerance", rotation_angular_tolerance_);
   get_parameter("pre_alignment.enabled", pre_alignment_enabled_);
   get_parameter("pre_alignment.timeout", pre_alignment_timeout_);
+  get_parameter("pre_alignment.min_angular_vel", pre_align_min_angular_vel_);
   get_parameter("pre_alignment.k_lateral", strafe_params_.k_lateral);
   get_parameter("pre_alignment.v_lateral_min", strafe_params_.v_lateral_min);
   get_parameter("pre_alignment.v_lateral_max", strafe_params_.v_lateral_max);
@@ -447,6 +453,10 @@ void DockingServer::rotateToDock(const geometry_msgs::msg::PoseStamped & dock_po
   rclcpp::Rate loop_rate(controller_frequency_);
   auto start = this->now();
   auto timeout = rclcpp::Duration::from_seconds(rotate_to_dock_timeout_);
+  // Ramp from the last commanded velocity, not measured odom — see the
+  // matching anchor in preAlignToDock (a gait-floor platform that ignores
+  // the first ramp step would otherwise be re-issued that step forever).
+  double last_cmd_wz = 0.0;
 
   while (rclcpp::ok()) {
     auto robot_pose = getRobotPoseInFrame(dock_pose.header.frame_id);
@@ -457,10 +467,11 @@ void DockingServer::rotateToDock(const geometry_msgs::msg::PoseStamped & dock_po
     }
 
     geometry_msgs::msg::Twist current_vel;
-    current_vel.angular.z = odom_sub_->getTwist().theta;
+    current_vel.angular.z = last_cmd_wz;
 
     auto command = controller_->computeRotateToHeadingCommand(
       angular_distance_to_heading, current_vel, dt);
+    last_cmd_wz = command.angular.z;
 
     vel_publisher_->publish(command);
 
@@ -482,6 +493,12 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
   // the bearing while nulling the lateral offset. The latch avoids stage
   // chatter when strafing perturbs the bearing near the tolerance boundary.
   bool rotate_stage_done = false;
+  // Accel-ramp anchor for the rotate command. Anchoring to the MEASURED odom
+  // yaw rate deadlocks on platforms with a yaw gait floor: the robot ignores
+  // the small first-step command, odom stays zero, and the ramp re-issues
+  // that same first step forever (Pozole 2026-09-01: 0.15 rad/s for 15 s,
+  // no motion). Ramp from what we last commanded instead.
+  double last_cmd_wz = 0.0;
 
   while (rclcpp::ok()) {
     publishDockingFeedback(DockRobot::Feedback::CONTROLLING);
@@ -533,11 +550,19 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
 
     // Rotate toward zero bearing in both stages: the primary motion of stage
     // one, and the bearing hold while strafing in stage two (the command
-    // self-limits near zero via its overshoot guard).
+    // self-limits near zero via its overshoot guard). The gait floor applies
+    // only while the bearing is outside tolerance — the in-band hold must not
+    // force the platform to micro-twitch while strafing.
     geometry_msgs::msg::Twist current_vel;
-    current_vel.angular.z = odom_sub_->getTwist().theta;
-    command.angular.z =
-      controller_->computeRotateToHeadingCommand(bearing, current_vel, dt).angular.z;
+    current_vel.angular.z = last_cmd_wz;
+    command.angular.z = applyRotationFloor(
+      controller_->computeRotateToHeadingCommand(bearing, current_vel, dt).angular.z,
+      bearing, rotation_angular_tolerance_, pre_align_min_angular_vel_);
+    last_cmd_wz = command.angular.z;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Pre-alignment: bearing %.3frad lateral %.3fm cmd [wz=%.3f vy=%.3f]",
+      bearing, e_lat, command.angular.z, command.linear.y);
     vel_publisher_->publish(command);
 
     if (this->now() - start > timeout) {
@@ -674,6 +699,12 @@ bool DockingServer::resetApproach(const geometry_msgs::msg::PoseStamped & stagin
   rclcpp::Rate loop_rate(controller_frequency_);
   auto start = this->now();
   auto timeout = rclcpp::Duration::from_seconds(dock_approach_timeout_);
+  // With pre-alignment enabled the retry re-squares yaw anyway, so the reset
+  // only needs to recover distance — holding the yaw gate here deadlocks a
+  // failed pre-align (yaw is off for the exact reason pre-align just failed;
+  // Pozole 2026-09-01 burned the full timeout backing up against it).
+  const double reset_angular_tolerance =
+    pre_alignment_enabled_ ? M_PI : undock_angular_tolerance_;
   while (rclcpp::ok()) {
     publishDockingFeedback(DockRobot::Feedback::INITIAL_PERCEPTION);
 
@@ -684,10 +715,29 @@ bool DockingServer::resetApproach(const geometry_msgs::msg::PoseStamped & stagin
       return false;
     }
 
+    // The retry only needs the robot back at the approach's own start state:
+    // behind the staging plane (not still on the dock side, where the tag is
+    // at marginal detection range) and inside the prestaging ball — the same
+    // gate a fresh dock_robot starts from. Squaring to the staging heading is
+    // NOT required (see reset_angular_tolerance above).
+    const auto robot_pose = getRobotPoseInFrame(staging_pose.header.frame_id);
+    const double dx = robot_pose.pose.position.x - staging_pose.pose.position.x;
+    const double dy = robot_pose.pose.position.y - staging_pose.pose.position.y;
+    const double dist_to_staging = std::hypot(dx, dy);
+    if (dist_to_staging < dock_prestaging_tolerance_ &&
+      isBehindStagingPlane(dx, dy, tf2::getYaw(staging_pose.pose.orientation)))
+    {
+      RCLCPP_INFO(
+        get_logger(), "Reset complete: behind staging within pre-staging tolerance (%.2fm)",
+        dist_to_staging);
+      publishZeroVelocity();
+      return true;
+    }
+
     // Compute and publish command
     geometry_msgs::msg::Twist command;
     if (getCommandToPose(
-        command, staging_pose, undock_linear_tolerance_, undock_angular_tolerance_, false,
+        command, staging_pose, undock_linear_tolerance_, reset_angular_tolerance, false,
         !dock_backwards_))
     {
       return true;
