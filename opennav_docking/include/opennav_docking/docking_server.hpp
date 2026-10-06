@@ -101,11 +101,12 @@ public:
   /**
    * @brief Pre-alignment stage before the control-law approach (forward
    * docking only, gated by pre_alignment.enabled). Stage 1 rotates in place
-   * until the bearing to the detected dock is inside
-   * rotation_angular_tolerance (reusing the rotate-to-heading command).
-   * Stage 2 strafes laterally (base-frame vy) onto the dock axis while
-   * holding the bearing, so holonomic platforms hand the approach law a
-   * near-straight problem. Runs on every approach attempt, retries included.
+   * until the bearing to the detected feature (plugin getDetectedPose, else
+   * the dock pose) is inside rotation_angular_tolerance (reusing the
+   * rotate-to-heading command). Stage 2 strafes laterally (base-frame vy)
+   * onto the dock axis while holding that bearing, so holonomic platforms
+   * hand the approach law a near-straight problem. Runs on every approach
+   * attempt, retries included.
    * @param dock Dock instance, gets queried for refined pose.
    * @param dock_pose Dock pose, refined by perception while aligning.
    * @returns True when aligned, False if cancelled/preempted. Throws

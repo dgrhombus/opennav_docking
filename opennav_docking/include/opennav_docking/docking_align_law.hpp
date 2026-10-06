@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace opennav_docking
 {
@@ -161,6 +162,82 @@ inline bool isWithinContactTolerance(
   }
   return std::fabs(normalizeAngle(yaw_err)) < yaw_thresh;
 }
+
+/// Dock-axis yaw from a single planar fiducial. IPPE_SQUARE returns two
+/// solutions whose tilt about the viewing ray differs only in sign, and for a
+/// small near-frontal tag their reprojection errors are indistinguishable.
+/// Given both candidates' fixed-frame (yaw, pitch): small tilt -> their mean;
+/// upright prior (true normal is horizontal, the mirrored one is pitched by
+/// ~2*sin(camera-to-tag elevation)) -> the flatter; parallax (true normal is
+/// fixed in odom, the mirrored one swings with the viewing ray) -> latch the
+/// track that stays tight once the other spreads; else hold the last output.
+struct TagYawResolver
+{
+  double sum_sin[2] = {0.0, 0.0};
+  double sum_cos[2] = {0.0, 0.0};
+  int n[2] = {0, 0};
+  double spread[2] = {0.0, 0.0};  // max |sample - running mean|
+  int chosen = -1;                // track latched by rule 3
+  bool have_last = false;
+  double last = 0.0;
+
+  void reset() {*this = TagYawResolver();}
+
+  double trackMean(int i) const {return std::atan2(sum_sin[i], sum_cos[i]);}
+
+  /// Unambiguous detection (solver was decisive).
+  double update(double yaw)
+  {
+    last = yaw;
+    have_last = true;
+    return yaw;
+  }
+
+  double update(double yaw_a, double pitch_a, double yaw_b, double pitch_b)
+  {
+    const double kSmallTilt = 0.15, kPitchMargin = 0.10, kTight = 0.05, kLoose = 0.15;
+    const int kMinSamples = 3;
+
+    if (n[0] > 0) {
+      const double straight = std::fabs(normalizeAngle(yaw_a - trackMean(0))) +
+        std::fabs(normalizeAngle(yaw_b - trackMean(1)));
+      const double swapped = std::fabs(normalizeAngle(yaw_b - trackMean(0))) +
+        std::fabs(normalizeAngle(yaw_a - trackMean(1)));
+      if (swapped < straight) {
+        std::swap(yaw_a, yaw_b);
+        std::swap(pitch_a, pitch_b);
+      }
+      spread[0] = std::max(spread[0], std::fabs(normalizeAngle(yaw_a - trackMean(0))));
+      spread[1] = std::max(spread[1], std::fabs(normalizeAngle(yaw_b - trackMean(1))));
+    }
+    const double yaws[2] = {yaw_a, yaw_b};
+    for (int i = 0; i < 2; i++) {
+      sum_sin[i] += std::sin(yaws[i]);
+      sum_cos[i] += std::cos(yaws[i]);
+      n[i]++;
+    }
+
+    double out;
+    const double mid = yaw_b + 0.5 * normalizeAngle(yaw_a - yaw_b);
+    if (chosen >= 0) {
+      out = trackMean(chosen);
+    } else if (std::fabs(normalizeAngle(yaw_a - yaw_b)) < kSmallTilt) {
+      out = mid;
+    } else if (std::fabs(std::fabs(pitch_a) - std::fabs(pitch_b)) > kPitchMargin) {
+      out = std::fabs(pitch_a) < std::fabs(pitch_b) ? yaw_a : yaw_b;
+    } else if (n[0] >= kMinSamples && n[1] >= kMinSamples &&
+      std::min(spread[0], spread[1]) < kTight && std::max(spread[0], spread[1]) > kLoose)
+    {
+      chosen = spread[0] < spread[1] ? 0 : 1;
+      out = trackMean(chosen);
+    } else {
+      out = have_last ? last : mid;
+    }
+    last = normalizeAngle(out);
+    have_last = true;
+    return last;
+  }
+};
 
 }  // namespace opennav_docking
 

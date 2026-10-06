@@ -26,6 +26,7 @@
 #include "tf2/utils.h"
 
 #include "opennav_docking_core/charging_dock.hpp"
+#include "opennav_docking/docking_align_law.hpp"
 #include "opennav_docking/pose_filter.hpp"
 
 namespace opennav_docking
@@ -84,6 +85,11 @@ public:
   virtual bool getRefinedPose(geometry_msgs::msg::PoseStamped & pose);
 
   /**
+   * @copydoc opennav_docking_core::ChargingDock::getDetectedPose
+   */
+  virtual bool getDetectedPose(geometry_msgs::msg::PoseStamped & pose);
+
+  /**
    * @copydoc opennav_docking_core::ChargingDock::isDocked
    */
   virtual bool isDocked();
@@ -108,11 +114,17 @@ protected:
 
   // Optionally subscribe to a detected dock pose topic
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr dock_pose_sub_;
+  // Second IPPE solution from the detector, same stamp as detected_dock_pose.
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr dock_pose_alt_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dock_pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr filtered_dock_pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr staging_pose_pub_;
   // If subscribed to a detected pose topic, will contain latest message
   geometry_msgs::msg::PoseStamped detected_dock_pose_;
+  geometry_msgs::msg::PoseStamped detected_dock_pose_alt_;
+  // Last detection in the fixed frame, before the dock offset (getDetectedPose)
+  geometry_msgs::msg::PoseStamped detected_fixed_pose_;
+  TagYawResolver yaw_resolver_;
   // This is the actual dock pose once it has the specified translation/rotation applied
   // If not subscribed to a topic, this is simply the database dock pose
   geometry_msgs::msg::PoseStamped dock_pose_;

@@ -137,6 +137,11 @@ void SimpleChargingDock::configure(
       [this](const geometry_msgs::msg::PoseStamped::SharedPtr pose) {
         detected_dock_pose_ = *pose;
       });
+    dock_pose_alt_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
+      "detected_dock_pose_alt", 1,
+      [this](const geometry_msgs::msg::PoseStamped::SharedPtr pose) {
+        detected_dock_pose_alt_ = *pose;
+      });
   }
 
   bool use_stall_detection;
@@ -161,9 +166,10 @@ void SimpleChargingDock::configure(
 geometry_msgs::msg::PoseStamped SimpleChargingDock::getStagingPose(
   const geometry_msgs::msg::Pose & pose, const std::string & frame)
 {
+  // This gets called at the start of docking
+  yaw_resolver_.reset();
   // If not using detection, set the dock pose as the given dock pose estimate
   if (!use_external_detection_pose_) {
-    // This gets called at the start of docking
     // Reset our internally tracked dock pose
     dock_pose_.header.frame_id = frame;
     dock_pose_.pose = pose;
@@ -234,20 +240,44 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
     }
   }
 
-  // Filter the detected pose
+  // Filter the detected pose (orientation is read pre-filter: the filter would
+  // blend the two mirrored IPPE candidates when the solver's order swaps)
+  const geometry_msgs::msg::Quaternion raw_orientation = detected.pose.orientation;
   detected = filter_->update(detected);
   filtered_dock_pose_pub_->publish(detected);
+  detected_fixed_pose_ = detected;
 
   if (use_external_detection_orientation_) {
-    // Rotate the just the orientation, then remove roll/pitch
-    geometry_msgs::msg::PoseStamped just_orientation;
-    just_orientation.pose.orientation = tf2::toMsg(external_detection_rotation_);
-    geometry_msgs::msg::TransformStamped transform;
-    transform.transform.rotation = detected.pose.orientation;
-    tf2::doTransform(just_orientation, just_orientation, transform);
+    // Remap the detector's optical-frame orientation to REP-103 and read the
+    // dock-axis yaw and the tag's pitch off the horizontal.
+    const auto remap = [this](const geometry_msgs::msg::Quaternion & q, double & yaw,
+        double & pitch) {
+        geometry_msgs::msg::PoseStamped just_orientation;
+        just_orientation.pose.orientation = tf2::toMsg(external_detection_rotation_);
+        geometry_msgs::msg::TransformStamped transform;
+        transform.transform.rotation = q;
+        tf2::doTransform(just_orientation, just_orientation, transform);
+        tf2::Quaternion r;
+        tf2::fromMsg(just_orientation.pose.orientation, r);
+        double roll;
+        tf2::Matrix3x3(r).getRPY(roll, pitch, yaw);
+      };
+    double yaw, pitch;
+    remap(raw_orientation, yaw, pitch);
+    // The detector publishes the second IPPE solution (same stamp) only when it
+    // cannot tell the two apart; TagYawResolver picks between them.
+    geometry_msgs::msg::PoseStamped alt = detected_dock_pose_alt_;
+    if (alt.header.stamp == detected.header.stamp) {
+      tf2_buffer_->transform(alt, alt, pose.header.frame_id);
+      double yaw_alt, pitch_alt;
+      remap(alt.pose.orientation, yaw_alt, pitch_alt);
+      yaw = yaw_resolver_.update(yaw, pitch, yaw_alt, pitch_alt);
+    } else {
+      yaw = yaw_resolver_.update(yaw);
+    }
 
     tf2::Quaternion orientation;
-    orientation.setEuler(0.0, 0.0, tf2::getYaw(just_orientation.pose.orientation));
+    orientation.setEuler(0.0, 0.0, yaw);
     dock_pose_.pose.orientation = tf2::toMsg(orientation);
   } else {
     // Heading from the seed: `pose` is the goal's dock pose (fixed frame) on
@@ -271,6 +301,15 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
   // Publish & return dock pose for debugging purposes
   dock_pose_pub_->publish(dock_pose_);
   pose = dock_pose_;
+  return true;
+}
+
+bool SimpleChargingDock::getDetectedPose(geometry_msgs::msg::PoseStamped & pose)
+{
+  if (detected_fixed_pose_.header.frame_id.empty()) {
+    return false;
+  }
+  pose = detected_fixed_pose_;
   return true;
 }
 

@@ -541,14 +541,20 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
               "Failed dock detection during pre-alignment");
     }
 
-    // Dock pose in the base frame drives both stages.
+    // Dock pose in the base frame drives the lateral offset; rotate/hold aim at
+    // the detected feature when the plugin exposes it (keeps it in the camera).
     geometry_msgs::msg::PoseStamped target_pose = dock_pose;
     target_pose.header.stamp = rclcpp::Time(0);
     tf2_buffer_->transform(target_pose, target_pose, base_frame_);
     const double x_d = target_pose.pose.position.x;
     const double y_d = target_pose.pose.position.y;
     const double yaw_d = tf2::getYaw(target_pose.pose.orientation);
-    const double bearing = std::atan2(y_d, x_d);
+    geometry_msgs::msg::PoseStamped aim_pose = target_pose;
+    if (dock->plugin->getDetectedPose(aim_pose)) {
+      aim_pose.header.stamp = rclcpp::Time(0);
+      tf2_buffer_->transform(aim_pose, aim_pose, base_frame_);
+    }
+    const double bearing = std::atan2(aim_pose.pose.position.y, aim_pose.pose.position.x);
     const double e_lat = lateralOffsetFromDockAxis(x_d, y_d, yaw_d);
 
     const bool bearing_ok = std::fabs(bearing) < rotation_angular_tolerance_;

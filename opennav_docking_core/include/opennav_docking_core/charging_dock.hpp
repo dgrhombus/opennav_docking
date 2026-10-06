@@ -84,6 +84,14 @@ public:
   virtual bool getRefinedPose(geometry_msgs::msg::PoseStamped & pose) = 0;
 
   /**
+   * @brief The raw detected feature (e.g. fiducial) pose behind the last
+   * getRefinedPose, in the same frame, before the plugin's dock offset is
+   * applied. Lets the server aim its camera at the feature itself rather
+   * than at the contact pose. Default: not available.
+   */
+  virtual bool getDetectedPose(geometry_msgs::msg::PoseStamped & /*pose*/) {return false;}
+
+  /**
    * @brief Have we made contact with dock? This can be implemented in a variety
    * of ways: by establishing communications with the dock, by monitoring the
    * the drive motor efforts, etc.
