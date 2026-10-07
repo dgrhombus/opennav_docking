@@ -513,6 +513,10 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
   bool rotate_stage_done = false;
   // Stage-2 bearing hold hysteresis state (computeBearingHoldCommand).
   bool hold_active = false;
+  // 3 distinct-stamp frames: one IPPE yaw flip swings e_lat ~0.9 m for a frame
+  // (Miso 2026-10-06) and a single lucky frame latched a target off the pad.
+  int aligned = 0;
+  builtin_interfaces::msg::Time aligned_stamp;
   BearingHoldParams hold_params;
   hold_params.tolerance = rotation_angular_tolerance_;
   hold_params.min_angular_vel = pre_align_min_angular_vel_;
@@ -570,11 +574,19 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
       const bool strafe_disabled = strafe_params_.v_lateral_max <= 0.0;
       const bool lateral_ok = std::fabs(e_lat) < pre_align_lateral_tolerance_;
       if (bearing_ok && (strafe_disabled || lateral_ok)) {
-        publishZeroVelocity();
-        RCLCPP_INFO(
-          get_logger(), "Pre-alignment complete (bearing %.3frad, lateral %.3fm)",
-          bearing, e_lat);
-        return true;
+        if (dock_pose.header.stamp != aligned_stamp) {
+          aligned_stamp = dock_pose.header.stamp;
+          aligned++;
+        }
+        if (aligned >= 3) {
+          publishZeroVelocity();
+          RCLCPP_INFO(
+            get_logger(), "Pre-alignment complete (bearing %.3frad, lateral %.3fm)",
+            bearing, e_lat);
+          return true;
+        }
+      } else {
+        aligned = 0;
       }
     }
 
@@ -625,6 +637,10 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
   auto start = this->now();
   auto timeout = rclcpp::Duration::from_seconds(dock_approach_timeout_);
   bool latched = false;
+  // Latch only on an estimate that has held still (doInitialPerception's test),
+  // so a yaw-flipped frame inside the latch radius is not frozen as the target.
+  geometry_msgs::msg::PoseStamped prev;
+  int agreeing = 0;
   while (rclcpp::ok()) {
     publishDockingFeedback(DockRobot::Feedback::CONTROLLING);
 
@@ -650,7 +666,12 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
       if (!dock->plugin->getRefinedPose(dock_pose) && !rotate_to_dock_) {
         throw opennav_docking_core::FailedToDetectDock("Failed dock detection");
       }
-      if (dock_pose_latch_distance_ > 0.0) {
+      if (dock_pose.header.stamp != prev.header.stamp) {
+        agreeing = (agreeing > 0 && utils::l2Norm(dock_pose.pose, prev.pose) < 0.10) ?
+          agreeing + 1 : 1;
+        prev = dock_pose;
+      }
+      if (dock_pose_latch_distance_ > 0.0 && agreeing >= 3) {
         const auto robot_pose = getRobotPoseInFrame(dock_pose.header.frame_id);
         const double dist_to_dock = std::hypot(
           robot_pose.pose.position.x - dock_pose.pose.position.x,
