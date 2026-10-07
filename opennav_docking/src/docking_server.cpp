@@ -60,6 +60,9 @@ DockingServer::DockingServer(const rclcpp::NodeOptions & options)
   // Cap for the stage-2 bearing hold (bang-bang with hysteresis, see
   // computeBearingHoldCommand); the floor above is its minimum.
   declare_parameter("pre_alignment.hold_angular_vel_max", 0.5);
+  // Rotate/hold against the dock-axis yaw instead of the bearing to the
+  // detected feature (for a dock heading that does not come from the detector).
+  declare_parameter("pre_alignment.align_to_dock_axis", false);
   declare_parameter("pre_alignment.k_lateral", 1.5);
   declare_parameter("pre_alignment.v_lateral_min", 0.0);
   declare_parameter("pre_alignment.v_lateral_max", 0.0);
@@ -92,6 +95,7 @@ DockingServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
   get_parameter("pre_alignment.timeout", pre_alignment_timeout_);
   get_parameter("pre_alignment.min_angular_vel", pre_align_min_angular_vel_);
   get_parameter("pre_alignment.hold_angular_vel_max", pre_align_hold_max_angular_vel_);
+  get_parameter("pre_alignment.align_to_dock_axis", pre_align_to_dock_axis_);
   get_parameter("pre_alignment.k_lateral", strafe_params_.k_lateral);
   get_parameter("pre_alignment.v_lateral_min", strafe_params_.v_lateral_min);
   get_parameter("pre_alignment.v_lateral_max", strafe_params_.v_lateral_max);
@@ -546,7 +550,8 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
     }
 
     // Dock pose in the base frame drives the lateral offset; rotate/hold aim at
-    // the detected feature when the plugin exposes it (keeps it in the camera).
+    // the dock axis, or at the detected feature when the plugin exposes it
+    // (keeps it in the camera).
     geometry_msgs::msg::PoseStamped target_pose = dock_pose;
     target_pose.header.stamp = rclcpp::Time(0);
     tf2_buffer_->transform(target_pose, target_pose, base_frame_);
@@ -558,7 +563,8 @@ bool DockingServer::preAlignToDock(Dock * dock, geometry_msgs::msg::PoseStamped 
       aim_pose.header.stamp = rclcpp::Time(0);
       tf2_buffer_->transform(aim_pose, aim_pose, base_frame_);
     }
-    const double bearing = std::atan2(aim_pose.pose.position.y, aim_pose.pose.position.x);
+    const double bearing = pre_align_to_dock_axis_ ? yaw_d :
+      std::atan2(aim_pose.pose.position.y, aim_pose.pose.position.x);
     const double e_lat = lateralOffsetFromDockAxis(x_d, y_d, yaw_d);
 
     const bool bearing_ok = std::fabs(bearing) < rotation_angular_tolerance_;
