@@ -61,6 +61,10 @@ void SimpleChargingDock::configure(
   // lateral offset is a direct function of that yaw.
   nav2_util::declare_parameter_if_not_declared(
     node_, name + ".use_external_detection_orientation", rclcpp::ParameterValue(true));
+  // Dock heading = line of sight robot -> detection; the detection's yaw is
+  // ignored (overrides use_external_detection_orientation).
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name + ".use_line_of_sight_orientation", rclcpp::ParameterValue(false));
 
   // Charging threshold from BatteryState message
   nav2_util::declare_parameter_if_not_declared(
@@ -99,6 +103,8 @@ void SimpleChargingDock::configure(
   node_->get_parameter(name + ".external_detection_timeout", external_detection_timeout_);
   node_->get_parameter(
     name + ".use_external_detection_orientation", use_external_detection_orientation_);
+  node_->get_parameter(
+    name + ".use_line_of_sight_orientation", use_line_of_sight_orientation_);
   node_->get_parameter(
     name + ".external_detection_translation_x", external_detection_translation_x_);
   node_->get_parameter(
@@ -247,7 +253,24 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
   filtered_dock_pose_pub_->publish(detected);
   detected_fixed_pose_ = detected;
 
-  if (use_external_detection_orientation_) {
+  if (use_line_of_sight_orientation_) {
+    geometry_msgs::msg::PoseStamped base_pose;
+    base_pose.header.stamp = rclcpp::Time(0);
+    base_pose.header.frame_id = base_frame_id_;
+    base_pose.pose.orientation.w = 1.0;
+    try {
+      tf2_buffer_->transform(base_pose, base_pose, detected.header.frame_id);
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN(node_->get_logger(), "Failed to transform base pose: %s", ex.what());
+      return false;
+    }
+    tf2::Quaternion orientation;
+    orientation.setEuler(
+      0.0, 0.0, std::atan2(
+        detected.pose.position.y - base_pose.pose.position.y,
+        detected.pose.position.x - base_pose.pose.position.x));
+    dock_pose_.pose.orientation = tf2::toMsg(orientation);
+  } else if (use_external_detection_orientation_) {
     // Remap the detector's optical-frame orientation to REP-103 and read the
     // dock-axis yaw and the tag's pitch off the horizontal.
     const auto remap = [this](const geometry_msgs::msg::Quaternion & q, double & yaw,
