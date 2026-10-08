@@ -320,6 +320,10 @@ bool SimpleChargingDock::getRefinedPose(geometry_msgs::msg::PoseStamped & pose)
   dock_pose_.pose.position.y += sin(yaw) * external_detection_translation_x_ +
     cos(yaw) * external_detection_translation_y_;
   dock_pose_.pose.position.z = 0.0;
+  RCLCPP_INFO(
+    node_->get_logger(), "dock detection: stamp=%.3f dock=(%.3f, %.3f, %.1fdeg)",
+    rclcpp::Time(dock_pose_.header.stamp).seconds(), dock_pose_.pose.position.x,
+    dock_pose_.pose.position.y, yaw * 180.0 / M_PI);
 
   // Publish & return dock pose for debugging purposes
   dock_pose_pub_->publish(dock_pose_);

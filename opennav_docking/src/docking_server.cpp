@@ -685,8 +685,13 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
         if (dist_to_dock < dock_pose_latch_distance_) {
           latched = true;
           RCLCPP_INFO(
-            get_logger(), "Dock pose latched at %.2fm; finishing approach on odom",
-            dist_to_dock);
+            get_logger(), "Dock pose latched at %.2fm; finishing approach on odom "
+            "(dock stamp=%.3f (%.3f, %.3f, %.1fdeg), robot (%.3f, %.3f, %.1fdeg))",
+            dist_to_dock, rclcpp::Time(dock_pose.header.stamp).seconds(),
+            dock_pose.pose.position.x, dock_pose.pose.position.y,
+            tf2::getYaw(dock_pose.pose.orientation) * 180.0 / M_PI,
+            robot_pose.pose.position.x, robot_pose.pose.position.y,
+            tf2::getYaw(robot_pose.pose.orientation) * 180.0 / M_PI);
         }
       }
     }
@@ -717,6 +722,11 @@ bool DockingServer::approachDock(Dock * dock, geometry_msgs::msg::PoseStamped & 
     if (!controller_->computeVelocityCommand(target_pose.pose, command, true, dock_backwards_)) {
       throw opennav_docking_core::FailedToControl("Failed to get control");
     }
+    RCLCPP_INFO(
+      get_logger(), "Approach: target base (%.3f, %.3f, %.1fdeg) cmd [vx=%.3f wz=%.3f]%s",
+      target_pose.pose.position.x, target_pose.pose.position.y,
+      tf2::getYaw(target_pose.pose.orientation) * 180.0 / M_PI,
+      command.linear.x, command.angular.z, latched ? " latched" : "");
     vel_publisher_->publish(command);
 
     if (this->now() - start > timeout) {
